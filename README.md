@@ -57,1879 +57,1218 @@ This README is the course material used by the lab. From the running application
 4. The lab’s **Read snapshot** deliberately uses a new group and does not commit offsets. It is a safe viewer, not a production consumer.
 5. Kafka UI is the companion tool for broker state, consumer groups, topic configuration, and administrative actions.
 
-## Apache Kafka — Complete Notes
-1. First understand the big picture: Event-Driven Architecture
+# Apache Kafka — Complete Practical Notes
 
-In a traditional application, one service often directly calls another:
+> A practical, beginner-friendly guide to Kafka covering Event-Driven Architecture, topics, brokers, partitions, producers, consumers, consumer groups, offsets, replication, acknowledgements, error handling, KRaft, and an end-to-end flow.
 
+## 📚 Table of Contents
+
+- [1. Event-Driven Architecture](#1-event-driven-architecture)
+- [2. Why Async Processing?](#2-why-async-processing)
+- [3. Message Queue vs Event Streaming](#3-message-queue-vs-event-streaming)
+- [4. What Is Kafka?](#4-what-is-kafka)
+- [5. Kafka Cluster and Brokers](#5-kafka-cluster-and-brokers)
+- [6. Topics](#6-topics)
+- [7. Partitions](#7-partitions)
+- [8. Producers](#8-producers)
+- [9. How a Producer Chooses a Partition](#9-how-a-producer-chooses-a-partition)
+- [10. Leader and Follower Replicas](#10-leader-and-follower-replicas)
+- [11. Replication and ISR](#11-replication-and-isr)
+- [12. Offsets](#12-offsets)
+- [13. Consumer Groups](#13-consumer-groups)
+- [14. Multiple Consumers and One Partition](#14-multiple-consumers-and-one-partition)
+- [15. Acknowledgements (`acks`)](#15-acknowledgements-acks)
+- [16. What Happens When Bad Data Enters Kafka?](#16-what-happens-when-bad-data-enters-kafka)
+- [17. Dead Letter Queue](#17-dead-letter-queue)
+- [18. Schema Validation](#18-schema-validation)
+- [19. How Kafka Knows the Leader](#19-how-kafka-knows-the-leader)
+- [20. KRaft](#20-kraft)
+- [21. Complete End-to-End Flow](#21-complete-end-to-end-flow)
+- [22. Practical Example](#22-practical-example)
+- [23. Useful Kafka CLI Commands](#23-useful-kafka-cli-commands)
+- [24. Quick Revision](#24-quick-revision)
+
+---
+
+## 1. Event-Driven Architecture
+
+In an **Event-Driven Architecture (EDA)**, services communicate by producing and consuming events instead of every service directly calling every other service.
+
+Example:
+
+```text
 Order Service
      |
-     | HTTP request
-     ↓
-Payment Service
+     | ORDER_PLACED
+     v
+    Kafka
+   /  |   \
+  v   v    v
+Payment Inventory Notification
+Service  Service   Service
+```
+
+This makes systems more loosely coupled and allows consumers to process work asynchronously.
+
+### Common asynchronous approaches
+
+| Approach | Typical use |
+|---|---|
+| Application threads | Small background work inside one application |
+| Database polling | Periodically check DB for changes |
+| Cron jobs | Scheduled batch processing |
+| Webhooks | Notify another service through HTTP |
+| Serverless / task services | Managed asynchronous execution |
+| Message queues | Distribute tasks/jobs |
+| Event streaming | Durable event history and multiple consumers |
+
+---
+
+## 2. Why Async Processing?
+
+Suppose an order API needs to:
+
+1. Save an order
+2. Charge payment
+3. Update inventory
+4. Send email
+5. Generate analytics
+
+Doing everything synchronously makes the API slow and tightly coupled.
+
+Instead:
+
+```text
+POST /orders
      |
-     | HTTP request
-     ↓
-Notification Service
+     v
+Order Service
+     |
+     | ORDER_PLACED
+     v
+   Kafka
+   / |  \
+  v  v   v
+Payment Inventory Email
+```
 
-This creates tight coupling.
+The API can finish quickly while downstream services process the event independently.
 
-In an Event-Driven Architecture (EDA), a service produces an event and other services react to it.
+---
 
-             ┌───────────────┐
-             │  Order Service│
-             └───────┬───────┘
-                     │
-               ORDER_PLACED
-                     │
-                     ↓
-              ┌─────────────┐
-              │    Kafka    │
-              └──────┬──────┘
-                     │
-        ┌────────────┼─────────────┐
-        ↓            ↓             ↓
-   Payment       Inventory     Notification
-   Service        Service        Service
+## 3. Message Queue vs Event Streaming
 
-The important idea is:
+### Message Queue
 
-Producer doesn't need to know who will consume the event.
+Think of a message queue as a **to-do list**.
 
-That's the main benefit of event-driven architecture.
-
-2. Different ways to perform asynchronous work
-
-Your screenshot lists several approaches.
-
-2.1 Application Threads
-
-Example:
-
-new Thread(() -> {
-    sendEmail();
-}).start();
-
-Suppose:
-
-User places order
-       ↓
-Application creates thread
-       ↓
-Send email
-Problem
-
-The work lives inside the application process.
-
-If your application crashes:
-
-Application
-    ↓
-Thread running
-    ↓
-💥 Application crashes
-
-Email job → LOST
-
-So application threads are:
-
-Simple
-Fast
-Good for small background work
-Not reliable for important distributed jobs
-3. Database as a background-job mechanism
-
-You can store jobs in a database.
-
-Example:
-
-jobs table
-
-id | type       | status
----|------------|--------
-1  | SEND_EMAIL | PENDING
-2  | SEND_SMS   | PENDING
-3  | SEND_EMAIL | PENDING
-
-Worker periodically checks:
-
-SELECT * FROM jobs
-WHERE status = 'PENDING';
-
-Then:
-
-Database
-    ↓
-Worker
-    ↓
-Process job
-    ↓
-UPDATE status = DONE
-Advantages
-Reliable
-Data survives application restart
-Easy to understand
-Problems
-
-If you have 100 workers continuously asking:
-
-"Any new jobs?"
-"Any new jobs?"
-"Any new jobs?"
-
-you get polling overhead.
-
-And at very large scale, the database can become the bottleneck.
-
-4. Cron Jobs
-
-Cron is basically:
-
-"Run this task at a scheduled time."
-
-Example:
-
-Every day at 2 AM
-        ↓
-Generate daily report
-
-Linux example:
-
-0 2 * * * generate-report.sh
-
-Good for:
-
-Daily reports
-Cleanup
-Backups
-Scheduled jobs
-
-Not ideal for:
-
-"Something happened. React immediately."
-
-For example:
-
-Payment successful
-       ↓
-Send notification immediately
-
-Cron is the wrong abstraction.
-
-5. Webhooks
-
-Webhook = HTTP callback.
-
-Imagine:
-
-Stripe
+```text
+Producer
    |
-   | HTTP POST
-   ↓
-Your application
+   v
+Queue
+   |
+   v
+Consumer
+   |
+   X
+message removed/acknowledged
+```
 
-For example:
+A message generally represents a job:
 
-{
-  "event": "payment.success",
-  "paymentId": "123"
-}
-
-Very useful when another system needs to notify you.
-
-Problem
-
-The receiver must be available.
-
-Stripe
-   ↓
-HTTP request
-   ↓
-Your server ❌ DOWN
-
-Now you need retry mechanisms, idempotency, signatures, etc.
-
-6. Serverless / Task Services
-
-Example:
-
-API
- ↓
-Task Queue
- ↓
-Worker / Lambda
-
-Cloud providers can manage much of the infrastructure.
-
-Useful when you don't want to operate your own worker infrastructure.
-
-7. Message Queue
-
-Think:
-
-"I have work that needs to be done."
-
-Example:
-
-Order Service
-     |
-     | SEND_EMAIL
-     ↓
- Message Queue
-     |
-     ↓
-Email Worker
-
-Message:
-
+```json
 {
   "type": "SEND_EMAIL",
   "orderId": "123"
 }
+```
 
-Worker processes it:
+Once processed, the application usually does not need the message anymore.
 
-Message
-   ↓
-Send email
-   ↓
-Message removed/acknowledged
+### Event Streaming
 
-The mental model is:
+Think of Kafka as an **immutable log/history**.
 
-To-do list
-
-8. Event Streaming
-
-Kafka belongs here.
-
-Think:
-
-"Something happened."
+```text
+Producer
+   |
+   v
+Kafka
+   |
+   +--> Payment Service
+   +--> Analytics Service
+   +--> Fraud Service
+```
 
 Example:
 
+```json
 {
   "event": "ORDER_PLACED",
   "orderId": "123"
 }
+```
 
-Kafka stores the event for a configured retention period.
+The event remains available according to the topic's retention policy.
 
-Multiple applications can consume it.
+Consumers can read at their own pace and can replay old events.
 
-                    ┌── Payment Service
-                    │
-ORDER_PLACED → Kafka├── Inventory Service
-                    │
-                    └── Analytics Service
+### Key difference
 
-And importantly:
+| Message Queue | Event Streaming |
+|---|---|
+| Task-oriented | Event/history-oriented |
+| Usually processed once by a worker | Multiple consumer groups can read independently |
+| Message disappears after processing in many queue systems | Event remains for retention period |
+| Replay is usually not the primary model | Replay is a core capability |
+| Example: send-email job | Example: `ORDER_PLACED` event |
 
-Payment Service
-      ↓
-reads event
+---
 
-Inventory Service
-      ↓
-reads same event
+## 4. What Is Kafka?
 
-Analytics Service
-      ↓
-reads same event
+**Apache Kafka is a distributed event streaming platform.**
 
-They don't have to consume it at exactly the same time.
+A simple mental model:
 
-9. Message Queue vs Event Streaming
+> **Kafka = distributed, durable, append-only log + consumers that track where they are in that log.**
 
-This distinction is very important.
+Kafka is commonly used for:
 
-Message Queue
+- Event-driven microservices
+- Log/event pipelines
+- Real-time analytics
+- Data integration
+- CDC pipelines
+- Monitoring
+- Stream processing
 
-Mental model:
+Kafka is **not primarily a traditional database**. It stores event records durably, but applications normally use databases for current-state queries.
 
-To-do list
+---
 
-Queue
+## 5. Kafka Cluster and Brokers
 
-[M1] [M2] [M3] [M4]
+A **Kafka cluster** is made up of multiple Kafka brokers.
 
-Worker A → M1
-Worker B → M2
-Worker C → M3
+A broker is a Kafka server/process that stores and serves partition data.
 
-Generally, a message is processed by one worker in a competing-consumer setup.
+```text
+Kafka Cluster
+│
+├── Broker 1
+├── Broker 2
+└── Broker 3
+```
 
-After successful processing, the message is acknowledged and eventually removed according to the queue semantics.
+Why multiple brokers?
 
-Kafka / Event Stream
+- High availability
+- Horizontal scaling
+- Data replication
+- Fault tolerance
 
-Mental model:
+### Important terminology
 
-Immutable history / log
-
-Partition
-
-Offset
-  0       1       2       3       4
-  ↓       ↓       ↓       ↓       ↓
-[M1]    [M2]    [M3]    [M4]    [M5]
-
-The events remain available according to the topic's retention policy.
-
-Consumer A:
-
-M1 → M2 → M3
-
-Consumer B:
-
-M1 → M2
-
-Consumer C could start later:
-
-M1 → M2 → M3 → M4
-
-That's why Kafka is much more than simply "a queue."
-
-10. What exactly is Kafka?
-
-A useful definition:
-
-Apache Kafka is a distributed event-streaming platform used to publish, store, process, and consume streams of records at scale.
-
-Think of Kafka as a distributed, durable, append-only log.
-
-11. Kafka's main components
-
-You need to understand these words extremely well:
-
-Producer
-Topic
-Partition
-Broker
+```text
 Cluster
-Consumer
-Consumer Group
-Offset
-Leader
-Follower
-Replication
-ISR
-Controller / KRaft
+  └── Brokers
+       └── Partitions
+            └── Records
+```
 
-Let's go one by one.
+---
 
-12. Producer
+## 6. Topics
 
-Producer = application that sends records to Kafka.
+A **topic** is a logical name/category for a stream of related events.
 
-Example:
+Examples:
 
-Order Service
-     |
-     | ORDER_PLACED
-     ↓
-   Kafka
-
-Code conceptually:
-
-producer.send(
-    new ProducerRecord<>("orders", "123", orderData)
-);
-
-Here:
-
-orders = topic
-123    = key
-orderData = value
-13. Topic
-
-A topic is a logical name/category for a stream of records.
-
-Example:
-
+```text
 orders
 payments
 shipments
 user-events
 notifications
+```
 
-You can think:
+Suppose we create:
 
+```text
 Topic: orders
+```
 
-ORDER_PLACED
-ORDER_CANCELLED
-ORDER_SHIPPED
-ORDER_DELIVERED
-Important correction
+Events could be:
 
-Saying:
+```json
+{"event":"ORDER_PLACED","orderId":101}
+{"event":"ORDER_PAID","orderId":101}
+{"event":"ORDER_SHIPPED","orderId":101}
+```
 
-"Topic is a set of similar events"
+### Important
 
-is a good beginner mental model.
+A topic is a **logical concept**.
 
-But technically:
+The actual records are stored inside the topic's **partitions**.
 
-A topic is a logical category/name for a stream of records and is divided into one or more partitions.
-
-Partitions actually contain the records.
-
-The topic itself isn't a physical storage location.
-
-14. Partition
-
-This is one of the most important Kafka concepts.
-
-Suppose:
-
-Topic = orders
-
-has 3 partitions:
-
-orders
-│
-├── Partition 0
-├── Partition 1
-└── Partition 2
-
-Each partition is an ordered append-only log.
-
-Example:
-
-Partition 0
-
-Offset
-  0       1       2       3
-  ↓       ↓       ↓       ↓
- O1      O4      O7      O9
-
-Another partition:
-
-Partition 1
-
-  0       1       2
-  ↓       ↓       ↓
- O2      O5      O8
-
-Another:
-
-Partition 2
-
-  0       1       2
-  ↓       ↓       ↓
- O3      O6      O10
-15. Ordering in Kafka
-
-Kafka guarantees ordering within a partition.
-
-Suppose:
-
-Partition 0
-
-M1 → M2 → M3 → M4
-
-A consumer reading this partition will see:
-
-M1
-M2
-M3
-M4
-
-in that order.
-
-But if:
-
-M1 → Partition 0
-M2 → Partition 1
-
-Kafka does not provide a global ordering guarantee across the two partitions.
-
-Remember:
-
-Ordering = partition-level, not topic-level.
-
-16. Why do we need partitions?
-
-Because one machine cannot necessarily handle all the traffic.
-
-Suppose:
-
-1 partition
-1 consumer
-
-and you have:
-
-10 million events/sec
-
-You need parallelism.
-
-So:
-
-orders topic
-
-P0
-P1
-P2
-P3
-P4
-P5
-
-Different partitions can be processed in parallel.
-
-That's where Kafka gets its scalability.
-
-17. Broker
-
-A Kafka broker is a Kafka server.
-
-Suppose you have:
-
-Kafka Cluster
-
-Broker 1
-Broker 2
-Broker 3
-
-Each broker is a machine/process running Kafka.
-
-A broker can store partitions.
-
-For example:
-
-Broker 1
- ├── orders-P0
- └── payments-P1
-
-Broker 2
- ├── orders-P1
- └── payments-P0
-
-Broker 3
- ├── orders-P2
- └── payments-P2
-18. Kafka Cluster
-
-A Kafka cluster is a group of Kafka brokers working together.
-
-              Kafka Cluster
-        ┌────────┼────────┐
-        ↓        ↓        ↓
-     Broker 1 Broker 2 Broker 3
-
-Why multiple brokers?
-
-Scalability
-Fault tolerance
-Replication
-Parallel processing
-High availability
-19. Topic → Partition → Broker
-
-This hierarchy is crucial.
-
-Kafka Cluster
-     │
-     ├── Broker 1
-     │
-     ├── Broker 2
-     │
-     └── Broker 3
-
+```text
 Topic: orders
-     │
-     ├── Partition 0
-     ├── Partition 1
-     └── Partition 2
+   |
+   +-- Partition 0
+   +-- Partition 1
+   +-- Partition 2
+```
 
-But partitions are hosted on brokers.
+---
 
-For example:
+## 7. Partitions
 
-orders
+A partition is an **ordered, append-only log**.
 
-P0 → Broker 1
-P1 → Broker 2
-P2 → Broker 3
+Example:
 
-And with replication:
-
-P0:
-Leader   → Broker 1
-Follower → Broker 2
-Follower → Broker 3
-20. Replication
-
-Suppose:
-
-Topic: orders
+```text
 Partition 0
 
-Replication factor = 3.
+offset 0 → ORDER_PLACED
+offset 1 → PAYMENT_RECEIVED
+offset 2 → ORDER_PACKED
+offset 3 → ORDER_SHIPPED
+```
 
-Kafka may store:
+Each record gets a monotonically increasing offset within its partition.
 
-Broker 1 → P0 Leader
-Broker 2 → P0 Follower
-Broker 3 → P0 Follower
+### Ordering
 
-So there are 3 copies of the partition's data.
-
-If Broker 1 dies:
-
-Broker 1 ❌
-
-Broker 2 → becomes leader
-Broker 3 → follower
-
-This provides fault tolerance.
-
-21. Leader and Followers
-
-For every partition, one replica is the leader.
-
-The others are followers.
-
-Example:
-
-Partition 0
-
-Broker 1
-   ↓
- LEADER
-
-Broker 2
-   ↓
- FOLLOWER
-
-Broker 3
-   ↓
- FOLLOWER
-
-Producer normally sends records to the leader of the partition.
-
-The leader coordinates writes and replication to followers.
-
-22. What happens when Producer sends a message?
-
-Let's use a real example.
-
-Suppose:
-
-{
-  "orderId": 123,
-  "customer": "Sachin",
-  "amount": 999
-}
-
-Producer wants to publish:
-
-Topic = orders
-Key = 123
-
-The flow is roughly:
-
-Producer
-   |
-   | 1. Get metadata
-   ↓
-Kafka Broker
-   |
-   | "Partition 1 leader is Broker 2"
-   ↓
-Producer
-   |
-   | 2. Send directly
-   ↓
-Broker 2
-   |
-   | 3. Write to Partition 1
-   ↓
-Followers replicate
-23. Does Producer send to any broker?
-
-At startup, the producer can connect to one or more configured bootstrap servers.
-
-It asks Kafka for metadata.
-
-Producer
-   |
-   | "Tell me about cluster metadata"
-   ↓
-Broker
-   |
-   ↓
-Metadata
-
-Topics
-Partitions
-Leaders
-Replicas
-
-Then the producer knows:
-
-orders-P0 → Broker 1
-orders-P1 → Broker 2
-orders-P2 → Broker 3
-
-So the producer can send the record to the appropriate broker.
-
-Important
-
-There isn't normally some central load balancer sitting in front of every Kafka write.
-
-The Kafka client uses metadata to route requests to the appropriate broker.
-
-24. How does Producer choose the partition?
-
-This depends on the record.
-
-Case 1 — Key is present
-
-Suppose:
-
-key = orderId
-
-Conceptually:
-
-partition = hash(key) % number_of_partitions
-
-For example:
-
-key = 123
-partitions = 3
-
-hash(123) % 3 = 1
-
-Therefore:
-
-order 123 → Partition 1
-
-This is useful because the same key is generally mapped to the same partition while the partitioning setup remains appropriate.
-
-Why is this useful?
-
-Suppose order 123 produces:
-
-ORDER_CREATED
-ORDER_PAID
-ORDER_SHIPPED
-ORDER_DELIVERED
-
-If all use the same key:
-
-orderId = 123
-
-they can land in the same partition.
-
-Therefore:
-
-P1
-
-ORDER_CREATED
-      ↓
-ORDER_PAID
-      ↓
-ORDER_SHIPPED
-      ↓
-ORDER_DELIVERED
-
-Their order can be preserved within that partition.
-
-25. What if there is no key?
-
-Kafka's producer partitioner can distribute records among partitions according to the producer's partitioning behavior/configuration.
-
-The important interview-level point is:
-
-Key present
-    ↓
-partition chosen based on key
-
-No key
-    ↓
-producer distributes records across available partitions
-
-Don't memorize "no key always means random" as a universal rule—the exact behavior depends on Kafka client/version/partitioner.
-
-26. Offset
-
-An offset is:
-
-A monotonically increasing number identifying a record's position within a partition.
-
-Example:
-
-Partition 0
-
-Offset
-  0       1       2       3       4
-  ↓       ↓       ↓       ↓       ↓
-  M1      M2      M3      M4      M5
-
-Important:
-
-Offset is unique only within a partition.
-
-So:
-
-Partition 0 → offset 10
-Partition 1 → offset 10
-
-can both exist.
-
-They are different records because their partitions differ.
-
-A record is effectively identified by:
-
-(topic, partition, offset)
-27. Offset is not "message ID"
-
-This is a common beginner mistake.
-
-Suppose:
-
-Partition 0
-Offset 0 → order A
-Offset 1 → order B
-Offset 2 → order C
-
-Offset tells Kafka/consumer:
-
-"Where am I in this partition?"
-
-It isn't necessarily a business identifier.
-
-Your business identifier could be:
-
-orderId = 123
-
-while Kafka offset could be:
-
-offset = 84921
-28. Where are consumer offsets stored?
-
-Kafka can store committed consumer offsets in an internal Kafka topic:
-
-__consumer_offsets
-
-Example conceptually:
-
-Consumer Group: payment-service
-
-orders-P0 → offset 57
-orders-P1 → offset 82
-
-This allows the consumer to restart and continue from its committed position.
-
-29. Consumer
-
-Consumer = application that reads records from Kafka.
-
-Example:
-
-Kafka
-  ↓
-Payment Service
-
-Payment service subscribes to:
-
-orders
-
-and consumes:
-
-ORDER_PLACED
-30. Consumer Group
-
-This is another very important Kafka concept.
-
-Suppose:
-
-Topic: orders
-
-P0
-P1
-P2
-
-Consumer group:
-
-payment-service
-
-has:
-
-Consumer A
-Consumer B
-Consumer C
-
-Kafka can assign:
-
-P0 → Consumer A
-P1 → Consumer B
-P2 → Consumer C
-
-So the work is parallelized.
-
-31. The golden rule of Consumer Groups
-
-Within a consumer group, a partition is assigned to at most one consumer at a time.
-
-Example:
-
-Topic
- ├── P0
- ├── P1
- └── P2
-
-Consumer Group
- ├── C1
- ├── C2
- └── C3
-
-P0 → C1
-P1 → C2
-P2 → C3
-32. Can multiple consumers read the same partition at the same time?
-
-This is the question shown at the bottom of your screenshot.
-
-Same consumer group?
-
-Generally NO.
-
-P0
- |
- +---- C1
-
-C2 cannot simultaneously own P0
-within the same group.
-Different consumer groups?
-
-YES.
-
-This is one of Kafka's superpowers.
-
-                 P0
-                 |
-        ┌────────┼─────────┐
-        ↓        ↓         ↓
-   Payment     Analytics   Audit
-   Group       Group       Group
-
-All three groups can independently read the same partition.
-
-Example:
-
-orders topic
-     ↓
- ┌───┴───────────────┐
- ↓                   ↓
-Payment Group     Analytics Group
- ↓                   ↓
-process payment   calculate metrics
-
-Each group maintains its own offsets.
-
-33. Consumer Group vs Multiple Consumers
-
-Suppose:
-
-3 partitions
-One consumer
-C1 → P0
-C1 → P1
-C1 → P2
-Three consumers
-C1 → P0
-C2 → P1
-C3 → P2
-
-More parallelism.
-
-Six consumers
-C1 → P0
-C2 → P1
-C3 → P2
-
-C4 → idle
-C5 → idle
-C6 → idle
-
-Because there are only 3 partitions.
-
-Therefore:
-
-Maximum active consumer parallelism within one consumer group is bounded by the number of partitions.
-
-This is extremely important.
-
-34. Consumer Group Example
-
-Imagine an e-commerce system.
-
-Topic:
-
-orders
-
-Consumer groups:
-
-payment-service
-inventory-service
-notification-service
-analytics-service
-
-Each group independently consumes the same events.
-
-                  orders
-                    │
-          ┌─────────┼─────────┐
-          ↓         ↓         ↓
-      Payment   Inventory  Notification
-       Group      Group       Group
-          │         │           │
-          ↓         ↓           ↓
-      Payments   Stock       Email/SMS
-
-This is where Kafka differs strongly from a traditional task queue.
-
-35. Kafka Consumer Pull Model
-
-Kafka consumers generally pull records from Kafka.
-
-Conceptually:
-
-Consumer
-   |
-   | "Give me records"
-   ↓
-Kafka
-   |
-   ↓
-Records
-
-The consumer controls how quickly it processes data.
-
-This is useful for backpressure.
-
-36. Producer → Kafka → Consumer complete flow
-
-Let's put everything together.
-
-Imagine an e-commerce application.
-
-User places an order:
-
-User
- ↓
-Order Service
-
-Order Service creates:
-
-{
-  "event": "ORDER_PLACED",
-  "orderId": 123,
-  "amount": 999
-}
-
-Producer sends it to:
-
-Topic: orders
-
-Kafka:
-
-orders
-│
-├── P0
-├── P1
-└── P2
-
-Suppose:
-
-hash(123) % 3 = 1
-
-Therefore:
-
-ORDER_PLACED
-      ↓
-Partition 1
-
-Partition 1 leader:
-
-Broker 2
-
-So:
-
-Producer
-   ↓
-Broker 2
-   ↓
-orders-P1
-
-Followers replicate:
-
-Broker 2 → Leader
-Broker 1 → Follower
-Broker 3 → Follower
-
-Then consumers read it.
-
-orders-P1
-    │
-    ├── Payment Group
-    │       ↓
-    │   Payment Service
-    │
-    ├── Inventory Group
-    │       ↓
-    │   Inventory Service
-    │
-    └── Analytics Group
-            ↓
-        Analytics Service
-
-That's Kafka end-to-end.
-
-37. acks — Producer Acknowledgement
-
-One of the important producer configurations.
-
-acks=0
-
-Producer doesn't wait for acknowledgement.
-
-Producer
-   ↓
-Kafka
-
-"I sent it!"
-
-Fast, but less reliable.
-
-acks=1
-
-Leader acknowledges after the leader has accepted/written the record.
-
-Producer
-   ↓
-Leader
-   ↓
-ACK
-
-Follower replication may still be ongoing.
-
-acks=all
-
-Producer waits for the leader to acknowledge after the record is replicated to the required ISR according to Kafka's replication/acknowledgement semantics.
-
-Conceptually:
-
-Producer
-   ↓
-Leader
-   ↓
-Followers
-   ↓
-ACK
-
-This provides stronger durability, assuming appropriate replication configuration.
-
-38. ISR — In-Sync Replicas
-
-Suppose:
-
-P0
-
-Broker 1 → Leader
-Broker 2 → Follower
-Broker 3 → Follower
-
-If all are caught up sufficiently:
-
-ISR = [Broker 1, Broker 2, Broker 3]
-
-ISR means:
-
-Replicas that are considered sufficiently in sync with the leader according to Kafka's replication rules.
-
-If Broker 3 falls behind badly:
-
-Broker 1 → Leader
-Broker 2 → In Sync
-Broker 3 → Behind
-
-ISR might become:
-
-[Broker 1, Broker 2]
-39. Why ISR matters
-
-Suppose:
-
-replication factor = 3
-
-and:
-
-ISR = 3 brokers
-
-Then you have good redundancy.
+Kafka guarantees ordering **within a partition**, not across the entire topic.
 
 If:
 
-Broker 1 💥
+```text
+P0 → A B C
+P1 → D E F
+P2 → G H I
+```
 
-Kafka can elect another eligible replica as leader.
+Kafka guarantees:
 
-Broker 2
-   ↓
-New Leader
+```text
+A before B before C
+```
 
-This is how Kafka survives broker failures.
+but does not provide a global ordering such as:
 
-40. What happens when a broker dies?
+```text
+A B C D E F G H I
+```
 
-Before:
+across all partitions.
 
-P0
+---
+
+## 8. Producers
+
+A **producer** publishes records to Kafka.
+
+Example:
+
+```text
+Order Service
+     |
+     | produce ORDER_PLACED
+     v
+Kafka topic: orders
+```
+
+Example record:
+
+```json
+{
+  "key": "123",
+  "event": "ORDER_PLACED",
+  "customerId": "C42",
+  "amount": 1499
+}
+```
+
+The producer is responsible for deciding which partition the record should go to.
+
+---
+
+## 9. How a Producer Chooses a Partition
+
+There are several possibilities.
+
+### Case 1: Key is present
+
+A common strategy is:
+
+```text
+partition = hash(key) % number_of_partitions
+```
+
+Example:
+
+```text
+key = orderId = 123
+
+hash(123) % 3 = 1
+
+→ Partition 1
+```
+
+This gives an important property:
+
+> The same key is consistently mapped to the same partition, assuming the partitioning setup remains compatible.
+
+Therefore events for the same order can remain ordered relative to one another.
+
+```text
+orderId=123
+     |
+     v
+Partition 1
+
+ORDER_PLACED
+PAYMENT_RECEIVED
+ORDER_SHIPPED
+```
+
+### Case 2: No key
+
+Kafka's producer partitioner can distribute records among available partitions according to its configured behavior.
+
+For workloads where ordering by an entity matters, using a meaningful key such as `orderId` is common.
+
+---
+
+## 10. Leader and Follower Replicas
+
+Partitions can be replicated across brokers.
+
+Example:
+
+```text
+Topic: orders
+
+Partition 0
+   |
+   +--> Broker 1  ← Leader
+   +--> Broker 2  ← Follower
+   +--> Broker 3  ← Follower
+```
+
+For a partition:
+
+- **Leader** handles writes and serves reads according to Kafka's protocol/configuration.
+- **Followers** replicate the leader's log.
+
+If the leader fails, Kafka can elect another suitable replica as leader.
+
+### Why replicate?
+
+Without replication:
+
+```text
+Broker 1
+   |
+Partition 0
+   |
+Broker dies
+   |
+DATA UNAVAILABLE
+```
+
+With replication:
+
+```text
+Broker 1 ← Leader
+Broker 2 ← Replica
+Broker 3 ← Replica
+
+Broker 1 dies
+     |
+     v
+Another eligible replica can become leader
+```
+
+---
+
+## 11. Replication and ISR
+
+**ISR = In-Sync Replicas**
+
+These are replicas considered sufficiently caught up with the leader according to Kafka's replication rules.
+
+Example:
+
+```text
+Partition 0
 
 Broker 1 → Leader
-Broker 2 → Follower
-Broker 3 → Follower
+Broker 2 → ISR
+Broker 3 → ISR
+```
 
-Broker 1 crashes:
+If Broker 2 falls too far behind, it can leave the ISR.
 
-Broker 1 ❌
+```text
+Broker 1 → Leader
+Broker 2 → ISR
+Broker 3 → Out of Sync
+```
 
-Kafka's controller manages partition leadership changes.
+ISR matters when using stronger producer acknowledgement settings such as:
 
-One eligible replica becomes leader:
+```text
+acks=all
+```
 
-Broker 2 → New Leader
-Broker 3 → Follower
+because Kafka can require acknowledgement from the relevant in-sync replicas according to the topic/broker configuration.
 
-Producer gets updated metadata and starts sending to Broker 2.
+---
 
-41. How does Kafka know who is leader?
+## 12. Offsets
 
-Kafka maintains cluster metadata.
+An **offset** is a monotonically increasing number identifying a record's position within a partition.
 
-It contains information such as:
+Example:
 
-Topics
-Partitions
-Partition leaders
-Replica assignments
-ISR
+```text
+Partition 0
 
-Modern Kafka uses KRaft for metadata management and consensus.
+offset 0 → A
+offset 1 → B
+offset 2 → C
+offset 3 → D
+```
 
-Older Kafka deployments used ZooKeeper.
+Offsets are **partition-specific**.
 
-Modern architecture
-Kafka Cluster
-      |
-      ↓
-KRaft controllers
-      |
-      ↓
-Cluster metadata
+So this is valid:
 
-So if you're learning modern Kafka:
+```text
+P0 → offset 0, 1, 2
+P1 → offset 0, 1, 2
+P2 → offset 0, 1, 2
+```
 
-Think KRaft, not ZooKeeper.
+Offset `2` in P0 is a different record from offset `2` in P1.
 
-ZooKeeper is important historically, but new Kafka deployments generally use KRaft.
+### Important mental model
 
-42. Kafka Controller
+> Offset = position in a partition log.
 
-The controller has responsibilities around cluster management, including things such as:
+---
 
-Partition leadership
-Replica state
-Broker membership
-Metadata management
-Failover coordination
+## 13. Consumer Groups
 
-Think:
+A **consumer group** is a set of consumers cooperating to consume partitions of a topic.
 
-Controller = cluster management brain
+Example:
 
-Not every normal record passes through a controller.
+```text
+Topic: orders
+Partitions: P0 P1 P2
 
-That's an important distinction.
+Consumer Group: payment-service
 
-43. Event Retention
+C1 → P0
+C2 → P1
+C3 → P2
+```
 
-One of Kafka's biggest advantages is that records aren't necessarily deleted immediately after a consumer reads them.
+Each partition is assigned to at most one consumer within the same consumer group at a time.
+
+### Multiple consumer groups
+
+Different groups can independently consume the same topic.
+
+```text
+                    orders
+                      |
+          +-----------+-----------+
+          |                       |
+    Payment Group            Analytics Group
+       / | \                     / |       C1 C2 C3                  A1 A2 A3
+```
+
+Both applications can process the same events independently.
+
+---
+
+## 14. Multiple Consumers and One Partition
+
+### Same consumer group
 
 Suppose:
 
-ORDER_PLACED
-ORDER_PAID
-ORDER_SHIPPED
+```text
+Partitions = 3
+Consumers  = 5
+```
 
-Kafka can retain them based on topic retention configuration.
+Only up to 3 consumers can actively own partitions at once.
 
-For example:
+```text
+C1 → P0
+C2 → P1
+C3 → P2
+C4 → idle
+C5 → idle
+```
 
-Retention = 7 days
+Why?
 
-Then records can remain available for that period, subject to retention configuration and storage constraints.
+Because a partition is assigned to only one consumer within a consumer group at a time.
 
-44. Replay
+### Different consumer groups
 
-Suppose Analytics Service had a bug.
+The same partition can absolutely be read by consumers in different groups.
 
-It processed:
+```text
+              P0
+            /    \
+           v      v
+       Group A  Group B
+          C1       C7
+```
 
-10 million events
+This is one of Kafka's most important scaling and fan-out concepts.
 
-incorrectly.
+---
 
-With a durable Kafka topic, you may be able to reset/reposition the consumer's offsets and process historical records again.
+## 15. Acknowledgements (`acks`)
 
-Kafka
+Producer acknowledgement controls how much confirmation the producer requires from Kafka.
 
-M1
-M2
-M3
-M4
-M5
-...
+### `acks=0`
 
-Consumer:
+Producer does not wait for a broker acknowledgement.
 
-Read M1
-Read M2
-Read M3
+```text
+Producer → Kafka
+     |
+     └── no acknowledgement wait
+```
 
-Later:
+Fast, but weakest delivery guarantee.
 
-Reset offset
-      ↓
-Read M1 again
-Read M2 again
-Read M3 again
+### `acks=1`
 
-This is called replay.
+Leader acknowledges after the record is written to the leader's log according to Kafka's acknowledgement semantics.
 
-That's extremely useful in event-driven systems.
+```text
+Producer → Leader
+             |
+             └── ACK
+```
 
-45. "Wrong data went into Kafka"
+If the leader fails before replication, durability can be weaker than `acks=all`.
 
-Your screenshot makes an important point:
+### `acks=all`
 
-Kafka is a log, not a traditional mutable database.
+The leader waits for the required in-sync replica acknowledgements based on Kafka configuration.
 
-Suppose you accidentally publish:
+```text
+Producer
+   |
+   v
+Leader
+   |
+   +--> Follower
+   +--> Follower
+   |
+   v
+ACK
+```
 
+This provides stronger durability, at the cost of additional coordination/latency.
+
+---
+
+## 16. What Happens When Bad Data Enters Kafka?
+
+Kafka is fundamentally a log. Once an event is written, applications generally should not think of Kafka like a database row that can simply be edited in place.
+
+### Strategy 1: Treat events as immutable facts
+
+Suppose:
+
+```json
 {
   "orderId": 123,
   "status": "DELIVERED"
 }
+```
 
-but the correct status was:
+was wrong.
 
-CANCELLED
+Instead of changing history, publish a correcting event:
 
-You generally don't think:
-
-UPDATE Kafka
-SET status = CANCELLED
-
-Instead, event-driven systems often publish another event:
-
+```json
 {
   "orderId": 123,
   "status": "CANCELLED"
 }
+```
 
-Now consumers process the history.
+Consumers build the appropriate state from the event history.
 
-Conceptually:
+This is related to **event-sourcing thinking**.
 
-ORDER_DELIVERED
-       ↓
-ORDER_CANCELLED
+### Strategy 2: Validate before producing
 
-The current state can be derived by applying events in order.
+Prevent invalid events from entering Kafka.
 
-This is related to event sourcing, although Kafka itself does not automatically make your entire system an event-sourced system.
+Common validation:
 
-46. Best place to validate data
+- Schema validation
+- Required fields
+- Type checks
+- Business rules
+- Enum/value validation
 
-Ideally:
+Example:
 
+```text
 Application
-     ↓
-Validation
-     ↓
-Schema/business validation
-     ↓
-Kafka
+    |
+    v
+Validate event
+    |
+    +---- invalid → reject
+    |
+    +---- valid → Kafka
+```
 
-Instead of:
+### Strategy 3: Dead Letter Queue
 
-Application
-     ↓
-Kafka
-     ↓
-Consumer discovers garbage
+If a consumer cannot process a record:
 
-Validation can include:
-
-Required fields
-Data types
-Schema compatibility
-Business rules
-Valid enum values
-
-For example:
-
-{
-  "orderId": 123,
-  "status": "BANANA"
-}
-
-If valid statuses are:
-
-PLACED
-PAID
-SHIPPED
-CANCELLED
-
-you should reject the bad event before it enters the main stream.
-
-47. Schema Registry
-
-Your screenshot mentions Schema Registry.
-
-Suppose producers send:
-
-{
-  "orderId": 123,
-  "amount": 999
-}
-
-and consumer expects:
-
-{
-  "orderId": 123,
-  "amount": 999,
-  "currency": "INR"
-}
-
-Schema management becomes important.
-
-Schema Registry helps manage schemas and compatibility rules.
-
-Common formats include:
-
-Avro
-Protobuf
-JSON Schema
-
-The key idea:
-
-Producer and consumer need an agreed contract for the event structure.
-
-48. Dead Letter Queue / Topic
-
-Suppose a consumer receives:
-
-{
-  "orderId": 123,
-  "amount": "HELLO"
-}
-
-Consumer tries:
-
-parse amount as number
-
-and fails.
-
-You don't want the consumer to crash forever on the same poisonous record.
-
-A common pattern is:
-
+```text
 Main Topic
-    ↓
+    |
+    v
 Consumer
-    ↓
-Processing fails
-    ↓
-DLQ / Dead Letter Topic
+    |
+    X processing fails
+    |
+    v
+DLQ Topic
+```
 
-DLQ might contain:
+The DLQ can retain:
 
-bad record
-error reason
-timestamp
-original topic
-partition
-offset
+- malformed records
+- unexpected values
+- processing failures
+- poison messages
 
-Then later:
+Later:
 
-Inspect
-Fix
-Replay if appropriate
-49. Important Kafka correction about DLQ
+```text
+DLQ
+ |
+ +--> inspect
+ +--> fix consumer/data
+ +--> replay if appropriate
+```
 
-Kafka itself doesn't automatically create a DLQ for every failed consumer record.
+---
 
-Usually your application/framework implements the dead-letter behavior.
+## 17. Dead Letter Queue
 
-For example:
+A Kafka DLQ is commonly implemented as another Kafka topic.
 
-Kafka Consumer
-      ↓
-Processing
-      ↓
-Exception
-      ↓
-Application publishes record to
-orders.DLT
+Example:
 
-So:
+```text
+orders
+   |
+   v
+payment-service
+   |
+   X invalid payment event
+   |
+   v
+orders.dlq
+```
 
-DLQ/DLT is a pattern, not a magical Kafka feature that automatically catches every error.
+A useful DLQ record often contains the original payload plus metadata:
 
-50. Complete Kafka Architecture
-
-Here's the picture I want you to keep in your head:
-
-                  ┌─────────────────┐
-                  │   Producer      │
-                  │  Order Service  │
-                  └────────┬────────┘
-                           │
-                           │ ORDER_PLACED
-                           ↓
-                 ┌────────────────────┐
-                 │   Kafka Cluster    │
-                 │                    │
-                 │  Broker 1          │
-                 │  Broker 2          │
-                 │  Broker 3          │
-                 └─────────┬──────────┘
-                           │
-                      Topic: orders
-                           │
-             ┌─────────────┼─────────────┐
-             ↓             ↓             ↓
-            P0            P1             P2
-             │             │              │
-             └─────────────┼──────────────┘
-                           │
-          ┌────────────────┼─────────────────┐
-          ↓                ↓                 ↓
-    Payment Group    Inventory Group   Analytics Group
-          ↓                ↓                 ↓
-      Payment          Inventory          Analytics
-       Service          Service            Service
-51. One complete real-world example
-
-Let's imagine Amazon-like e-commerce.
-
-User buys a phone.
-
-Step 1 — User places order
-User
- ↓
-Order Service
-
-Order Service creates:
-
+```json
 {
-  "event": "ORDER_PLACED",
-  "orderId": "ORD123",
-  "productId": "IPHONE15",
-  "amount": 69999
+  "originalTopic": "orders",
+  "originalPartition": 2,
+  "originalOffset": 9182,
+  "error": "INVALID_PAYMENT_STATE",
+  "payload": {
+    "orderId": 123
+  }
 }
-Step 2 — Producer sends event
-Order Service
-      ↓
-Kafka Producer
-      ↓
-orders topic
+```
 
-Key:
+This makes debugging and controlled replay easier.
 
-ORD123
-Step 3 — Kafka chooses partition
+---
 
-Suppose:
+## 18. Schema Validation
 
-hash("ORD123") % 3 = 1
+In real systems, producers and consumers need an agreed data contract.
 
-Then:
+Without a schema:
 
-orders-P1
-Step 4 — Find leader
+```text
+Producer → { "amount": 100 }
+Consumer expects → { "amount": "100" }
+```
+
+Problems can appear at runtime.
+
+A schema system can define:
+
+- Field names
+- Data types
+- Required/optional fields
+- Compatibility rules
+- Versioning
+
+A common Kafka ecosystem component is **Schema Registry**.
+
+Mental model:
+
+```text
+Producer
+   |
+   v
+Schema validation
+   |
+   v
+Kafka
+   |
+   v
+Consumer
+```
+
+---
+
+## 19. How Kafka Knows the Leader
+
+Kafka maintains cluster metadata describing things such as:
+
+- Topics
+- Partitions
+- Leader broker for each partition
+- Replicas
+- ISR
+
+A producer first obtains metadata from Kafka.
+
+Example:
+
+```text
+Producer
+   |
+   | metadata request
+   v
+Kafka
+   |
+   | P1 → Broker 2 is leader
+   v
+Producer
+   |
+   | send directly
+   v
+Broker 2
+```
+
+The producer caches metadata and refreshes it when it becomes stale or Kafka reports a leadership change.
+
+There is **no need for a separate load balancer in front of every partition write**.
+
+---
+
+## 20. KRaft
+
+Modern Kafka uses **KRaft** for its metadata management and consensus architecture.
+
+Historically:
+
+```text
+Kafka
+  |
+ZooKeeper
+```
+
+Modern Kafka:
+
+```text
+Kafka
+  |
+KRaft controllers
+```
+
+KRaft removes Kafka's dependency on ZooKeeper for Kafka's own metadata/cluster management.
+
+A simplified mental model:
+
+```text
+Kafka Cluster
+│
+├── Broker 1
+├── Broker 2
+├── Broker 3
+│
+└── Controller quorum
+      ├── Controller 1
+      ├── Controller 2
+      └── Controller 3
+```
+
+The controllers manage cluster metadata and participate in the controller quorum.
+
+---
+
+## 21. Complete End-to-End Flow
+
+### Step 1 — Producer starts
+
+Producer connects to a Kafka broker.
+
+```text
+Producer
+   |
+   v
+Any reachable Kafka broker
+```
+
+It asks for cluster metadata.
+
+### Step 2 — Producer receives metadata
+
+Producer learns information such as:
+
+```text
+Topics
+Partitions
+Leader brokers
+Replica information
+```
+
+It caches the metadata.
+
+### Step 3 — Producer wants to send an event
+
+Example:
+
+```json
+{
+  "key": "123",
+  "event": "ORDER_PLACED"
+}
+```
+
+Producer must determine the target partition.
+
+### Step 4 — Producer chooses partition
+
+With a key:
+
+```text
+hash("123") % 3 = 1
+
+→ Partition 1
+```
+
+### Step 5 — Producer finds partition leader
 
 Metadata says:
 
-orders-P1
+```text
+Partition 1 → Broker 2
+```
 
-Leader → Broker 2
-Follower → Broker 1
-Follower → Broker 3
+So the producer sends the record directly to Broker 2.
 
-Producer sends directly to Broker 2.
+### Step 6 — Leader writes the record
 
-Producer
-   ↓
-Broker 2
-   ↓
-orders-P1
-Step 5 — Leader writes
+Broker 2:
 
-Kafka appends:
+1. Appends record to partition log
+2. Assigns an offset
+3. Replicates to followers
 
-Offset 5821
+Example:
 
-ORDER_PLACED
-ORD123
-Step 6 — Followers replicate
-Broker 2
-   ↓
-Broker 1
-Broker 3
-Step 7 — Producer gets acknowledgement
+```text
+P1
 
-If using:
+offset 0 → ORDER_PLACED
+offset 1 → PAYMENT_RECEIVED
+offset 2 → ORDER_SHIPPED
+```
 
+### Step 7 — Followers replicate
+
+Followers copy the leader's records and maintain their replica logs.
+
+With:
+
+```text
 acks=all
+```
 
-the producer gets acknowledgement after the relevant replication condition is satisfied.
+the producer gets acknowledgement after the required ISR acknowledgement conditions are satisfied.
 
-52. Consumers now react
-Payment Service
+### Step 8 — Consumer reads
+
+Consumer obtains metadata and knows:
+
+```text
+Partition 1 → Broker 2
+```
+
+It fetches records and tracks its progress using offsets.
+
+```text
+Consumer
+   |
+   | fetch from P1
+   v
+offset 0 → processed
+offset 1 → processed
+offset 2 → next
+```
+
+---
+
+## 22. Practical Example
+
+Imagine an e-commerce application.
+
+### Services
+
+```text
+order-service
+payment-service
+inventory-service
+notification-service
+analytics-service
+```
+
+### Topic
+
+```text
 orders
- ↓
-Payment Consumer
- ↓
-Charge ₹69,999
-Inventory Service
+```
+
+### Event
+
+```json
+{
+  "eventId": "evt-1001",
+  "eventType": "ORDER_PLACED",
+  "orderId": "ORD-123",
+  "customerId": "C-42",
+  "amount": 2499
+}
+```
+
+### Producer
+
+`order-service` produces:
+
+```text
+key = ORD-123
+topic = orders
+```
+
+Kafka maps the key to a partition:
+
+```text
+hash(ORD-123) % 3 = 1
+
+→ orders-1
+```
+
+### Consumers
+
+```text
 orders
- ↓
-Inventory Consumer
- ↓
-Reserve iPhone
-Notification Service
-orders
- ↓
-Notification Consumer
- ↓
-Send order confirmation
-Analytics
-orders
- ↓
-Analytics Consumer
- ↓
-Update dashboard
+  |
+  +--> payment-service
+  |
+  +--> inventory-service
+  |
+  +--> notification-service
+  |
+  +--> analytics-service
+```
 
-And all of these can independently maintain their own consumer-group offsets.
+Each service can use a separate consumer group.
 
-53. Why Kafka is powerful
+For example:
 
-Without Kafka:
+```text
+payment-group
+inventory-group
+notification-group
+analytics-group
+```
 
-Order Service
-   ├──→ Payment
-   ├──→ Inventory
-   ├──→ Notification
-   ├──→ Analytics
-   └──→ Fraud
+Therefore each service can independently receive the same order event.
 
-Order Service becomes tightly coupled to everyone.
+### Event sequence
 
-With Kafka:
+```text
+ORDER_PLACED
+      |
+      v
+PAYMENT_COMPLETED
+      |
+      v
+ORDER_PACKED
+      |
+      v
+ORDER_SHIPPED
+      |
+      v
+ORDER_DELIVERED
+```
 
-Order Service
-      ↓
-    Kafka
-      ↓
- ┌────┼─────┬──────┬──────┐
- ↓    ↓     ↓      ↓      ↓
-Pay  Inv  Notify  Fraud Analytics
+The exact architecture depends on the application's business rules; Kafka does not automatically enforce this business state machine.
 
-Order Service only needs to know:
+---
 
-"Publish ORDER_PLACED."
+## 23. Useful Kafka CLI Commands
 
-It doesn't need to know who consumes it.
+### Create a topic
 
-54. Scaling Kafka
+```bash
+kafka-topics.sh   --create   --topic orders   --partitions 3   --replication-factor 3   --bootstrap-server localhost:9092
+```
 
-Suppose:
+### List topics
 
-orders topic
+```bash
+kafka-topics.sh   --list   --bootstrap-server localhost:9092
+```
 
-P0
-P1
-P2
+### Describe a topic
 
-and:
+```bash
+kafka-topics.sh   --describe   --topic orders   --bootstrap-server localhost:9092
+```
 
-Consumer Group
+This helps inspect partition leaders, replicas and ISR.
 
-C1
-C2
-C3
+### Produce messages
 
-Kafka can parallelize:
+```bash
+kafka-console-producer.sh   --topic orders   --bootstrap-server localhost:9092
+```
 
-P0 → C1
-P1 → C2
-P2 → C3
+### Consume messages
 
-Now traffic increases.
+```bash
+kafka-console-consumer.sh   --topic orders   --bootstrap-server localhost:9092
+```
 
-You can increase partitions:
+### Consume from the beginning
 
-P0
-P1
-P2
-P3
-P4
-P5
+```bash
+kafka-console-consumer.sh   --topic orders   --from-beginning   --bootstrap-server localhost:9092
+```
 
-and scale consumers accordingly:
+---
 
-C1 → P0
-C2 → P1
-C3 → P2
-C4 → P3
-C5 → P4
-C6 → P5
+## 24. Quick Revision
 
-That's horizontal scalability.
+### Kafka in one diagram
 
-55. One subtle but important point: partition count
+![Kafka Architecture](docs/images/kafka-architecture.svg)
 
-Suppose you have:
+```text
+                    Kafka Cluster
+                         |
+        +----------------+----------------+
+        |                |                |
+     Broker 1         Broker 2         Broker 3
+        |                |                |
+       P0               P1               P2
+        |
+   ordered log
+        |
+  offset 0,1,2,3...
+```
 
-6 partitions
+### Remember these relationships
 
-You cannot get useful parallel consumption from 20 consumers in one consumer group.
+```text
+Kafka Cluster
+     |
+     +-- Broker
+          |
+          +-- Topic
+               |
+               +-- Partition
+                    |
+                    +-- Record
+                         |
+                         +-- Offset
+```
 
-At most 6 consumers can actively own partitions at a time.
+### Most important rules
 
-6 partitions
+1. **Topic = logical stream/category**
+2. **Partition = ordered append-only log**
+3. **Broker = Kafka server**
+4. **Cluster = multiple brokers**
+5. **Offset = record position inside a partition**
+6. **Ordering is guaranteed within a partition**
+7. **Same key commonly maps records to the same partition**
+8. **Partition leaders handle writes**
+9. **Followers replicate leaders**
+10. **ISR = in-sync replicas**
+11. **Consumer groups provide parallel processing**
+12. **One partition is assigned to at most one consumer in a consumer group at a time**
+13. **Different consumer groups can independently read the same topic**
+14. **Kafka retains records according to retention configuration**
+15. **Kafka is a log/event-streaming platform, not simply a task queue**
+16. **Validate data before producing whenever possible**
+17. **DLQ topics can isolate records that fail processing**
+18. **KRaft provides Kafka's modern metadata/consensus architecture**
 
-C1 → P0
-C2 → P1
-C3 → P2
-C4 → P3
-C5 → P4
-C6 → P5
+---
 
-C7 → idle
-C8 → idle
-...
-C20 → idle
+## 📁 Suggested GitHub Repository Structure
 
-Therefore:
+```text
+kafka-learning/
+│
+├── README.md
+│
+├── docs/
+│   └── images/
+│       ├── kafka-architecture.svg
+│       └── kafka-partition-offset.svg
+│
+├── examples/
+│   ├── producer/
+│   └── consumer/
+│
+├── docker/
+│   └── docker-compose.yml
+│
+└── commands/
+    └── kafka-cli.md
+```
 
-Partition count is an important scalability decision.
-
-56. Kafka's mental model
-
-If you remember only one picture, remember this:
-
-                 KAFKA CLUSTER
-                       │
-                       ↓
-                    TOPIC
-                       │
-              ┌────────┼────────┐
-              ↓        ↓        ↓
-             P0       P1       P2
-              │        │        │
-          ordered    ordered   ordered
-             log       log       log
-              │        │        │
-           offsets   offsets   offsets
-              │
-              ↓
-         Consumer Group
-              │
-        ┌─────┼─────┐
-        ↓     ↓     ↓
-       C1    C2    C3
-
-And physically:
-
-Partition 0
-     ↓
-Broker 1 = Leader
-Broker 2 = Follower
-Broker 3 = Follower
-57. The entire Kafka vocabulary in one table
-Concept	Simple meaning
-Producer	Application that writes records
-Consumer	Application that reads records
-Topic	Logical stream/category of records
-Partition	Ordered append-only log inside a topic
-Broker	Kafka server
-Cluster	Group of Kafka brokers
-Offset	Position of a record within a partition
-Consumer Group	Consumers working together
-Leader	Replica responsible for partition's normal write/read coordination
-Follower	Replica that follows the leader
-Replication	Keeping copies of partition data
-ISR	Replicas considered sufficiently in sync
-Controller	Manages cluster metadata/state
-KRaft	Kafka's modern metadata/consensus architecture
-Retention	How long Kafka keeps records
-Replay	Reading old records again
-acks	Producer acknowledgement level
-Schema Registry	Manages event schemas/contracts
-DLQ/DLT	Destination for records that couldn't be processed
-Rebalance	Reassignment of partitions among consumers in a group
-58. The 10 things you absolutely must remember
-
-If you're preparing for backend/system-design interviews, nail these first:
-
-1.
-
-Kafka is an event-streaming platform, not just a queue.
-
-2.
-
-Topic is logical; partitions are where records are stored.
-
-3.
-
-A partition is an ordered append-only log.
-
-4.
-
-Ordering is guaranteed within a partition, not across the entire topic.
-
-5.
-
-Offset identifies a record's position within a partition.
-
-6.
-
-A broker is a Kafka server.
-
-7.
-
-A Kafka cluster contains multiple brokers.
-
-8.
-
-A partition can have multiple replicas, with one leader and followers.
-
-9.
-
-Within one consumer group, a partition is assigned to at most one consumer at a time.
-
-10.
-
-Different consumer groups can independently consume the same Kafka records.
+The SVG diagrams in this repository are intentionally kept as text-based SVG files, so GitHub can render them directly and they remain easy to version-control.
 
 ## Advanced notes: the concepts needed for real systems
 
